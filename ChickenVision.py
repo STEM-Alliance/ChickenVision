@@ -66,7 +66,11 @@ class VideoShow:
     """
 
     def __init__(self, imgWidth, imgHeight, cameraServer, frame=None):
-        self.outputStream = cameraServer.putVideo("stream", imgWidth, imgHeight)
+        try:
+            self.outputStream = cameraServer.getServer(name="stream")
+        except:
+            self.outputStream = cameraServer.putVideo("stream", imgWidth, imgHeight)
+        
         self.frame = frame
         self.stopped = False
 
@@ -98,7 +102,7 @@ class WebcamVideoStream:
         #Make a blank image to write on
         self.img = np.zeros(shape=(frameWidth, frameHeight, 3), dtype=np.uint8)
         #Gets the video
-        self.stream = cameraServer.getVideo()
+        self.stream = cameraServer.getVideo(camera=camera)
         (self.timestamp, self.img) = self.stream.grabFrame(self.img)
 
         # initialize the thread name
@@ -192,8 +196,6 @@ def blurImg(frame, blur_radius):
 # Masks the video based on a range of hsv colors
 # Takes in a frame, range of color, and a blurred frame, returns a masked frame
 def threshold_video(lower_color, upper_color, blur):
-
-
     # Convert BGR to HSV
     hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
 
@@ -338,6 +340,9 @@ def findBall(contours, image, centerX, centerY):
             currentAngleError = finalTarget
             #pushes cargo angle to network tables
             networkTable.putNumber("cargoYaw", currentAngleError)
+
+            # rx, ry, rw, rh = cv2.boundingRect(biggestCargo)
+            # calculateDistance()
 
         else:
             #pushes that it doesn't see cargo to network tables
@@ -672,10 +677,12 @@ def startCamera(config):
     print("Starting camera '{}' on {}".format(config.name, config.path))
     cs = CameraServer.getInstance()
     camera = cs.startAutomaticCapture(name=config.name, path=config.path)
-
     camera.setConfigJson(json.dumps(config.config))
 
-    return cs, camera
+    return camera
+
+def configCamera(camera, config):
+    camera.setConfigJson(json.dumps(config.config))
 
 if __name__ == "__main__":
     if len(sys.argv) >= 2:
@@ -696,74 +703,118 @@ if __name__ == "__main__":
         print("Setting up NetworkTables client for team {}".format(team))
         ntinst.startClientTeam(team)
 
+    networkTable.putBoolean("Tape", False)
+    networkTable.putBoolean("Driver", False)
+    networkTable.putBoolean("Cargo", True)
+
+    networkTable.putBoolean("cargoDetected", False)
+    networkTable.putNumber("cargoYaw", 0)
+    networkTable.putBoolean("tapeDetected", False)
+    networkTable.putNumber("tapeYaw", 0)
 
     # start cameras
     cameras = []
-    streams = []
     for cameraConfig in cameraConfigs:
-        cs, cameraCapture = startCamera(cameraConfig)
-        streams.append(cs)
+        cameraCapture = startCamera(cameraConfig)
         cameras.append(cameraCapture)
     #Get the first camera
 
-    webcam = cameras[0]
-    cameraServer = streams[0]
-    #Start thread reading camera
-    cap = WebcamVideoStream(webcam, cameraServer, image_width, image_height).start()
+    cameraIndex = 0
+    newCameraIndex = -1
+    networkTable.putNumber("CameraIndex", cameraIndex)
 
     # (optional) Setup a CvSource. This will send images back to the Dashboard
     # Allocating new images is very expensive, always try to preallocate
     img = np.zeros(shape=(image_height, image_width, 3), dtype=np.uint8)
+
+    cameraServer = CameraServer.getInstance()
     #Start thread outputing stream
-    streamViewer = VideoShow(image_width,image_height, cameraServer, frame=img).start()
-    #cap.autoExpose=True;
-    tape = False
-    fps = FPS().start()
-    #TOTAL_FRAMES = 200;
-    # loop forever
-    while True:
-        # Tell the CvSink to grab a frame from the camera and put it
-        # in the source image.  If there is an error notify the output.
-        timestamp, img = cap.read()
-        #Uncomment if camera is mounted upside down
-        #frame = flipImage(img)
-        #Comment out if camera is mounted upside down
-        frame = img
-        if timestamp == 0:
-            # Send the output the error.
-            streamViewer.notifyError(cap.getError());
-            # skip the rest of the current iteration
-            continue
-        #Checks if you just want camera for driver (No processing), False by default
-        if(networkTable.getBoolean("Driver", False)):
-            cap.autoExpose = True
-            processed = frame
-        else:
-            # Checks if you just want camera for Tape processing , False by default
-            if(networkTable.getBoolean("Tape", False)):
+    streamViewer = VideoShow(image_width, image_height, cameraServer, frame=img).start()
+
+    while True:    
+        cameraChange = False
+        print("[INFO] camera: {:d}".format(cameraIndex))
+        webcam = cameras[cameraIndex]
+        #Start thread reading camera
+        cap = WebcamVideoStream(webcam, cameraServer, image_width, image_height).start()
+
+        #cap.autoExpose=True;
+        tape = False
+        fps = FPS().start()
+
+        #TOTAL_FRAMES = 200;
+        # loop forever
+        while not cameraChange:
+            # Tell the CvSink to grab a frame from the camera and put it
+            # in the source image.  If there is an error notify the output.
+            timestamp, img = cap.read()
+
+            #Uncomment if camera is mounted upside down
+            #frame = flipImage(img)
+            #Comment out if camera is mounted upside down
+            frame = img
+
+            if timestamp == 0:
+                # Send the output the error.
+                streamViewer.notifyError(cap.getError())
+                # skip the rest of the current iteration
+                continue
+
+            # figure out which camera to use
+            if networkTable.getBoolean("Driver", False):
+                state = 0
+                networkTable.putBoolean("Tape", False)
+                networkTable.putBoolean("Cargo", False)
+            elif networkTable.getBoolean("Tape", False):
+                state = 1
+                networkTable.putBoolean("Driver", False)
+                networkTable.putBoolean("Cargo", False)
+            else: #if networkTable.getBoolean("Cargo", False):
+                state = 2
+                networkTable.putBoolean("Driver", False)
+                networkTable.putBoolean("Tape", False)
+
+            #Checks if you just want camera for driver (No processing), False by default
+            if state == 0:
+                cap.autoExpose = True
+                processed = frame
+
+            elif state == 1:
+                # Checks if you just want camera for Tape processing , False by default
                 #Lowers exposure to 0
                 cap.autoExpose = False
                 boxBlur = blurImg(frame, green_blur)
                 threshold = threshold_video(lower_green, upper_green, boxBlur)
                 processed = findTargets(frame, threshold)
+
             else:
                 # Checks if you just want camera for Cargo processing, by dent of everything else being false, true by default
                 cap.autoExpose = True
                 boxBlur = blurImg(frame, orange_blur)
                 threshold = threshold_video(lower_orange, upper_orange, boxBlur)
                 processed = findCargo(frame, threshold)
-        #Puts timestamp of camera on netowrk tables
-        networkTable.putNumber("VideoTimestamp", timestamp)
-        streamViewer.frame = processed
-        # update the FPS counter
-        fps.update()
-        #Flushes camera values to reduce latency
-        ntinst.flush()
-    #Doesn't do anything at the moment. You can easily get this working by indenting these three lines
-    # and setting while loop to: while fps._numFrames < TOTAL_FRAMES
-    fps.stop()
-    print("[INFO] elasped time: {:.2f}".format(fps.elapsed()))
-    print("[INFO] approx. FPS: {:.2f}".format(fps.fps()))
+
+            #Puts timestamp of camera on netowrk tables
+            networkTable.putNumber("VideoTimestamp", timestamp)
+            streamViewer.frame = processed
+
+            # update the FPS counter
+            fps.update()
+            #Flushes camera values to reduce latency
+            ntinst.flush()
+
+            newCameraIndex = int(networkTable.getNumber("CameraIndex", cameraIndex))
+            if newCameraIndex < len(cameras) and newCameraIndex >= 0 and cameraIndex != newCameraIndex:
+                configCamera(cameras[cameraIndex], cameraConfigs[cameraIndex])
+                cameraIndex = newCameraIndex
+                cameraChange = True
+                cap.stop()
+
+        #Doesn't do anything at the moment. You can easily get this working by indenting these three lines
+        # and setting while loop to: while fps._numFrames < TOTAL_FRAMES
+        fps.stop()
+        print("[INFO] elasped time: {:.2f}".format(fps.elapsed()))
+        print("[INFO] approx. FPS: {:.2f}".format(fps.fps()))
 
 
 
